@@ -1,915 +1,683 @@
 # =========================================================
-# Swissmetro: Shapley exacto global + local con Apollo
-# Warm starts + gráficos robustos (sin shapviz)
-# Incluye una curva de predicción usando apollo_prediction()
-# con fallback manual si Apollo no devuelve el formato esperado
+# 04_shapley_exacto.R
+# Shapley exacto global y local para el MNL base Swissmetro
 # =========================================================
 
-# -----------------------------
-# 0) Paquetes
-# -----------------------------
-req_pkgs <- c(
-  "apollo", "dplyr", "readr", "tidyr",
-  "ggplot2", "ggbeeswarm", "patchwork", "scales"
-)
-
-miss_pkgs <- req_pkgs[!sapply(req_pkgs, requireNamespace, quietly = TRUE)]
-if (length(miss_pkgs) > 0) {
-  stop(
-    paste0(
-      "Faltan paquetes: ",
-      paste(miss_pkgs, collapse = ", "),
-      ". Instálalos antes de correr el script."
-    )
-  )
-}
-
+# 1. Cargar paquetes
 library(apollo)
-library(dplyr)
-library(readr)
-library(tidyr)
 library(ggplot2)
-library(ggbeeswarm)
-library(patchwork)
-library(scales)
 
-# -----------------------------
-# 1) Cargar base limpia
-# -----------------------------
-sm <- readRDS("data/processed/swissmetro_clean.rds")
+set.seed(2026)
 
-sm <- sm |>
-  mutate(
-    id        = as.integer(id),
-    choice    = as.integer(choice),   # 1=train, 2=sm, 3=car
-    train_av  = as.integer(train_av),
-    sm_av     = as.integer(sm_av),
-    car_av    = as.integer(car_av),
-    train_tt  = as.numeric(train_tt),
-    train_co  = as.numeric(train_co),
-    sm_tt     = as.numeric(sm_tt),
-    sm_co     = as.numeric(sm_co),
-    car_tt    = as.numeric(car_tt),
-    car_co    = as.numeric(car_co),
-    age       = as.numeric(age),
-    ga        = as.numeric(ga),
-    luggage   = as.numeric(luggage),
-    sm_seats  = as.numeric(sm_seats)
-  )
+# 2. Definir rutas y opciones
+calcular_local <- TRUE
+hacer_graficos <- TRUE
+reconstruir_cache <- FALSE
+limpiar_archivos_apollo <- TRUE
 
-N <- nrow(sm)
+archivo_entrada <- file.path("data", "processed", "swissmetro_clean.csv")
+directorio_salida <- "output"
+directorio_tablas <- file.path(directorio_salida, "tablas")
+directorio_figuras <- file.path(directorio_salida, "figuras")
+directorio_apollo <- file.path(directorio_salida, "apollo_coalitions")
+directorio_cache <- file.path(directorio_salida, "cache_coaliciones")
 
-cat("=====================================================\n")
-cat("Swissmetro: exacto global + local con Apollo y warm starts\n")
-cat("=====================================================\n")
-cat("Observaciones:", N, "\n")
-cat("IDs únicos:", dplyr::n_distinct(sm$id), "\n\n")
+dir.create(directorio_tablas, recursive = TRUE, showWarnings = FALSE)
+dir.create(directorio_figuras, recursive = TRUE, showWarnings = FALSE)
+dir.create(directorio_apollo, recursive = TRUE, showWarnings = FALSE)
 
-# -----------------------------
-# 2) Configuración
-# -----------------------------
-players <- c("mode", "time", "cost", "age", "ga", "luggage", "seats")
-P <- length(players)
+if (reconstruir_cache && dir.exists(directorio_cache)) {
+  unlink(directorio_cache, recursive = TRUE, force = TRUE)
+}
 
-ll_null <- N * log(1 / 3)
+dir.create(directorio_cache, recursive = TRUE, showWarnings = FALSE)
 
-# Benchmark validado previamente
-benchmark_start <- c(
-  asc_car    =  2.132789,
-  asc_sm     =  1.870174,
-  b_time     = -0.012359,
-  b_cost     = -0.001011,
-  b_age      =  0.251225,
-  b_ga       =  6.656641,
-  b_luggage  = -0.083423,
-  b_seats    =  0.550311
+# 3. Definir jugadores y parametros del MNL
+jugadores <- c("mode", "time", "cost", "age", "ga", "luggage", "seats")
+
+mapa_parametros <- list(
+  mode = c("asc_car", "asc_sm"),
+  time = "b_time",
+  cost = "b_cost",
+  age = "b_age",
+  ga = "b_ga",
+  luggage = "b_luggage",
+  seats = "b_seats"
 )
 
-dir.create("output", showWarnings = FALSE)
-dir.create("output/tablas", recursive = TRUE, showWarnings = FALSE)
-dir.create("output/figuras", recursive = TRUE, showWarnings = FALSE)
-dir.create("output/apollo_coalitions", recursive = TRUE, showWarnings = FALSE)
+todos_parametros <- unique(unlist(mapa_parametros, use.names = FALSE))
 
-unlink("output/cache_coaliciones", recursive = TRUE, force = TRUE)
-dir.create("output/cache_coaliciones", recursive = TRUE, showWarnings = FALSE)
-
-CALC_LOCAL <- TRUE
-MAKE_PLOTS <- TRUE
-
-apollo_initialise()
-
-# -----------------------------
-# 3) Funciones auxiliares
-# -----------------------------
-all_param_names <- c(
-  "asc_car", "asc_sm",
-  "b_time", "b_cost", "b_age", "b_ga", "b_luggage", "b_seats"
+# Coeficientes del modelo completo usados como punto inicial.
+# Estos valores reproducen la Tabla 7 de Salas et al. (2025).
+coeficientes_iniciales <- c(
+  asc_car = 2.132789,
+  asc_sm = 1.870174,
+  b_time = -0.012359,
+  b_cost = -0.001011,
+  b_age = 0.251225,
+  b_ga = 6.656641,
+  b_luggage = -0.083423,
+  b_seats = 0.550311
 )
 
-coalition_key <- function(S) {
-  if (length(S) == 0) return("EMPTY")
-  key <- paste(sort(S), collapse = "__")
-  key <- gsub("[^A-Za-z0-9_\\-]", "_", key)
-  key
+# 4. Cargar datos depurados
+df <- read.csv(archivo_entrada, stringsAsFactors = FALSE)
+names(df) <- tolower(names(df))
+
+df$id <- as.integer(df$id)
+df$choice <- as.integer(df$choice)
+df$train_av <- as.integer(df$train_av)
+df$sm_av <- as.integer(df$sm_av)
+df$car_av <- as.integer(df$car_av)
+df$train_tt <- as.numeric(df$train_tt)
+df$train_co <- as.numeric(df$train_co)
+df$sm_tt <- as.numeric(df$sm_tt)
+df$sm_co <- as.numeric(df$sm_co)
+df$car_tt <- as.numeric(df$car_tt)
+df$car_co <- as.numeric(df$car_co)
+df$age <- as.numeric(df$age)
+df$ga <- as.numeric(df$ga)
+df$luggage <- as.numeric(df$luggage)
+df$sm_seats <- as.numeric(df$sm_seats)
+
+n_obs <- nrow(df)
+ll_nulo <- n_obs * log(1 / 3)
+
+# 5. Definir funciones auxiliares
+completar_beta <- function(parametros_activos, valores_activos) {
+  beta <- setNames(rep(0, length(todos_parametros)), todos_parametros)
+
+  if (length(parametros_activos) > 0) {
+    beta[parametros_activos] <- valores_activos
+  }
+
+  return(beta)
 }
 
-coalition_to_params <- function(S) {
-  pars <- character(0)
-  
-  if ("mode" %in% S)    pars <- c(pars, "asc_car", "asc_sm")
-  if ("time" %in% S)    pars <- c(pars, "b_time")
-  if ("cost" %in% S)    pars <- c(pars, "b_cost")
-  if ("age" %in% S)     pars <- c(pars, "b_age")
-  if ("ga" %in% S)      pars <- c(pars, "b_ga")
-  if ("luggage" %in% S) pars <- c(pars, "b_luggage")
-  if ("seats" %in% S)   pars <- c(pars, "b_seats")
-  
-  pars
-}
-
-fill_beta <- function(active_par, par_values) {
-  beta <- setNames(rep(0, length(all_param_names)), all_param_names)
-  if (length(active_par) > 0) beta[active_par] <- par_values
-  beta
-}
-
-compute_utilities <- function(df, beta) {
+calcular_utilidades <- function(datos, beta) {
   V_train <-
-    beta["b_time"] * df$train_tt +
-    beta["b_cost"] * df$train_co +
-    beta["b_age"]  * df$age +
-    beta["b_ga"]   * df$ga
-  
+    beta["b_time"] * datos$train_tt +
+    beta["b_cost"] * datos$train_co +
+    beta["b_age"] * datos$age +
+    beta["b_ga"] * datos$ga
+
   V_sm <-
     beta["asc_sm"] +
-    beta["b_time"]  * df$sm_tt +
-    beta["b_cost"]  * df$sm_co +
-    beta["b_ga"]    * df$ga +
-    beta["b_seats"] * df$sm_seats
-  
+    beta["b_time"] * datos$sm_tt +
+    beta["b_cost"] * datos$sm_co +
+    beta["b_ga"] * datos$ga +
+    beta["b_seats"] * datos$sm_seats
+
   V_car <-
     beta["asc_car"] +
-    beta["b_time"]    * df$car_tt +
-    beta["b_cost"]    * df$car_co +
-    beta["b_luggage"] * df$luggage
-  
-  cbind(train = V_train, sm = V_sm, car = V_car)
+    beta["b_time"] * datos$car_tt +
+    beta["b_cost"] * datos$car_co +
+    beta["b_luggage"] * datos$luggage
+
+  return(cbind(train = V_train, sm = V_sm, car = V_car))
 }
 
-softmax_rows <- function(V) {
-  maxV <- apply(V, 1, max)
-  Vc <- V - maxV
-  expV <- exp(Vc)
-  denom <- rowSums(expV)
-  expV / denom
+calcular_probabilidades <- function(V) {
+  V_centrado <- V - apply(V, 1, max)
+  exp_V <- exp(V_centrado)
+  return(exp_V / rowSums(exp_V))
 }
 
-loglik_mnl <- function(choice, probs) {
-  idx <- cbind(seq_along(choice), choice)
-  p <- probs[idx]
-  p <- pmax(p, 1e-300)
-  sum(log(p))
+calcular_loglik <- function(choice, probabilidades) {
+  prob_elegida <- probabilidades[cbind(seq_along(choice), choice)]
+  return(sum(log(pmax(prob_elegida, 1e-300))))
 }
 
-generate_all_coalitions <- function(players) {
-  out <- list(character(0))
-  if (length(players) == 0) return(out)
-  
-  for (k in seq_along(players)) {
-    cmb <- combn(players, k, simplify = FALSE)
-    out <- c(out, cmb)
+clave_coalicion <- function(S) {
+  if (length(S) == 0) {
+    return("EMPTY")
   }
-  out
+
+  return(gsub("[^A-Za-z0-9_\\-]", "_", paste(sort(S), collapse = "__")))
 }
 
-cleanup_apollo_files <- function(model_name, out_dir) {
-  files <- list.files(
-    out_dir,
-    pattern = paste0("^", model_name),
+parametros_coalicion <- function(S) {
+  return(unique(unlist(mapa_parametros[S], use.names = FALSE)))
+}
+
+generar_coaliciones <- function(jugadores) {
+  coaliciones <- list(character(0))
+
+  for (k in seq_along(jugadores)) {
+    coaliciones <- c(coaliciones, combn(jugadores, k, simplify = FALSE))
+  }
+
+  return(coaliciones)
+}
+
+limpiar_apollo <- function(nombre_modelo) {
+  archivos <- list.files(
+    directorio_apollo,
+    pattern = paste0("^", nombre_modelo),
     full.names = TRUE
   )
-  if (length(files) > 0) unlink(files, force = TRUE)
+
+  if (length(archivos) > 0) {
+    unlink(archivos, force = TRUE)
+  }
 }
 
-# -----------------------------
-# 4) Estimación por coalición
-# -----------------------------
-estimate_mnl_coalition_apollo <- function(S, df, ll_null, benchmark_start) {
-  
-  key <- coalition_key(S)
-  cache_file <- file.path("output/cache_coaliciones", paste0("coal_", key, ".rds"))
-  
-  if (file.exists(cache_file)) {
-    return(readRDS(cache_file))
+normalizar_resultado <- function(resultado) {
+  if (is.null(resultado$coalicion) && !is.null(resultado$coalition)) {
+    resultado$coalicion <- resultado$coalition
   }
-  
-  active_par <- coalition_to_params(S)
-  
-  # Coalición vacía = modelo nulo
-  if (length(active_par) == 0) {
-    beta_full <- fill_beta(character(0), numeric(0))
-    V <- compute_utilities(df, beta_full)
-    probs <- softmax_rows(V)
-    ll_manual <- loglik_mnl(df$choice, probs)
-    
-    out <- list(
-      coalition = S,
-      key = key,
-      active_par = active_par,
-      beta = beta_full,
-      ll_final = ll_manual,
-      rho2 = 1 - (ll_manual / ll_null),
-      probs = probs,
-      converged = TRUE,
-      method = "manual_empty"
-    )
-    
-    saveRDS(out, cache_file)
-    return(out)
+
+  if (is.null(resultado$parametros_activos) && !is.null(resultado$active_params)) {
+    resultado$parametros_activos <- resultado$active_params
   }
-  
-  database <- df
-  model_name <- paste0("smcoal_", key)
-  out_dir <- "output/apollo_coalitions"
-  
-  apollo_control <- list(
-    modelName       = model_name,
-    modelDescr      = paste("Swissmetro coalition", key),
-    indivID         = "id",
-    panelData       = TRUE,
-    outputDirectory = out_dir
+
+  if (is.null(resultado$probabilidades) && !is.null(resultado$probs)) {
+    resultado$probabilidades <- resultado$probs
+  }
+
+  if (is.null(resultado$convergencia) && !is.null(resultado$converged)) {
+    resultado$convergencia <- resultado$converged
+  }
+
+  if (is.null(resultado$metodo) && !is.null(resultado$method)) {
+    resultado$metodo <- resultado$method
+  }
+
+  return(resultado)
+}
+
+# 6. Estimar modelos por coalicion
+estimar_coalicion_vacia <- function(S, datos, archivo_cache) {
+  beta <- completar_beta(character(0), numeric(0))
+  probabilidades <- calcular_probabilidades(calcular_utilidades(datos, beta))
+  ll_final <- calcular_loglik(datos$choice, probabilidades)
+
+  resultado <- list(
+    coalicion = S,
+    key = clave_coalicion(S),
+    parametros_activos = character(0),
+    beta = beta,
+    ll_final = ll_final,
+    rho2 = 1 - ll_final / ll_nulo,
+    probabilidades = probabilidades,
+    convergencia = TRUE,
+    metodo = "manual_empty"
   )
-  
-  # Warm start desde el benchmark validado
-  apollo_beta <- benchmark_start[active_par]
+
+  saveRDS(resultado, archivo_cache)
+  return(resultado)
+}
+
+estimar_coalicion <- function(S, datos) {
+  key <- clave_coalicion(S)
+  archivo_cache <- file.path(directorio_cache, paste0("coal_", key, ".rds"))
+
+  if (file.exists(archivo_cache)) {
+    return(normalizar_resultado(readRDS(archivo_cache)))
+  }
+
+  parametros_activos <- parametros_coalicion(S)
+
+  if (length(parametros_activos) == 0) {
+    return(estimar_coalicion_vacia(S, datos, archivo_cache))
+  }
+
+  database <- datos
+  nombre_modelo <- paste0("smcoal_", key)
+
+  apollo_control <- list(
+    modelName = nombre_modelo,
+    modelDescr = paste("Swissmetro coalition", key),
+    indivID = "id",
+    panelData = TRUE,
+    outputDirectory = directorio_apollo
+  )
+
+  apollo_beta <- coeficientes_iniciales[parametros_activos]
   apollo_fixed <- c()
-  
+
   apollo_probabilities <- function(apollo_beta, apollo_inputs, functionality = "estimate") {
-    
     apollo_attach(apollo_beta, apollo_inputs)
     on.exit(apollo_detach(apollo_beta, apollo_inputs))
-    
+
     V <- list(train = 0, sm = 0, car = 0)
-    
-    if ("asc_sm" %in% names(apollo_beta))  V[["sm"]]  <- V[["sm"]]  + asc_sm
-    if ("asc_car" %in% names(apollo_beta)) V[["car"]] <- V[["car"]] + asc_car
-    
+
+    if ("asc_sm" %in% names(apollo_beta)) {
+      V[["sm"]] <- V[["sm"]] + asc_sm
+    }
+
+    if ("asc_car" %in% names(apollo_beta)) {
+      V[["car"]] <- V[["car"]] + asc_car
+    }
+
     if ("b_time" %in% names(apollo_beta)) {
       V[["train"]] <- V[["train"]] + b_time * train_tt
-      V[["sm"]]    <- V[["sm"]]    + b_time * sm_tt
-      V[["car"]]   <- V[["car"]]   + b_time * car_tt
+      V[["sm"]] <- V[["sm"]] + b_time * sm_tt
+      V[["car"]] <- V[["car"]] + b_time * car_tt
     }
-    
+
     if ("b_cost" %in% names(apollo_beta)) {
       V[["train"]] <- V[["train"]] + b_cost * train_co
-      V[["sm"]]    <- V[["sm"]]    + b_cost * sm_co
-      V[["car"]]   <- V[["car"]]   + b_cost * car_co
+      V[["sm"]] <- V[["sm"]] + b_cost * sm_co
+      V[["car"]] <- V[["car"]] + b_cost * car_co
     }
-    
+
     if ("b_age" %in% names(apollo_beta)) {
       V[["train"]] <- V[["train"]] + b_age * age
     }
-    
+
     if ("b_ga" %in% names(apollo_beta)) {
       V[["train"]] <- V[["train"]] + b_ga * ga
-      V[["sm"]]    <- V[["sm"]]    + b_ga * ga
+      V[["sm"]] <- V[["sm"]] + b_ga * ga
     }
-    
+
     if ("b_luggage" %in% names(apollo_beta)) {
       V[["car"]] <- V[["car"]] + b_luggage * luggage
     }
-    
+
     if ("b_seats" %in% names(apollo_beta)) {
       V[["sm"]] <- V[["sm"]] + b_seats * sm_seats
     }
-    
-    P <- list()
-    
+
     mnl_settings <- list(
       alternatives = c(train = 1, sm = 2, car = 3),
-      avail        = list(train = train_av, sm = sm_av, car = car_av),
-      choiceVar    = choice,
-      V            = V
+      avail = list(train = train_av, sm = sm_av, car = car_av),
+      choiceVar = choice,
+      V = V
     )
-    
+
+    P <- list()
     P[["model"]] <- apollo_mnl(mnl_settings, functionality)
     P <- apollo_panelProd(P, apollo_inputs, functionality)
     P <- apollo_prepareProb(P, apollo_inputs, functionality)
-    
     return(P)
   }
-  
-  apollo_inputs <- NULL
-  modelo <- NULL
-  
+
   invisible(capture.output({
     apollo_inputs <- apollo_validateInputs()
   }))
-  
-  modelo <- tryCatch(
-    {
-      invisible(capture.output({
-        apollo_estimate(
-          apollo_beta,
-          apollo_fixed,
-          apollo_probabilities,
-          apollo_inputs
-        ) -> modelo_tmp
-      }))
-      modelo_tmp
-    },
-    error = function(e) NULL
-  )
-  
-  if (is.null(modelo)) {
-    stop(paste("Apollo falló en la coalición:", key))
-  }
-  
-  beta_active <- modelo$estimate
-  beta_full <- fill_beta(active_par, beta_active)
-  
-  # Valor oficial del ajuste usando las mismas probs que usaremos luego
-  V <- compute_utilities(df, beta_full)
-  probs <- softmax_rows(V)
-  ll_manual <- loglik_mnl(df$choice, probs)
-  
-  out <- list(
-    coalition = S,
-    key = key,
-    active_par = active_par,
-    beta = beta_full,
-    ll_final = ll_manual,
-    rho2 = 1 - (ll_manual / ll_null),
-    probs = probs,
-    converged = TRUE,
-    method = "Apollo_warmstart"
-  )
-  
-  saveRDS(out, cache_file)
-  cleanup_apollo_files(model_name, out_dir)
-  
-  out
-}
 
-# -----------------------------
-# 5) Estimar todas las coaliciones
-# -----------------------------
-coalitions <- generate_all_coalitions(players)
-
-cat("Número total de coaliciones:", length(coalitions), "\n")
-cat("Debería ser 2^P =", 2^P, "\n\n")
-
-results_list <- vector("list", length(coalitions))
-names(results_list) <- vapply(coalitions, coalition_key, character(1))
-
-for (i in seq_along(coalitions)) {
-  S <- coalitions[[i]]
-  key <- coalition_key(S)
-  
-  cat(sprintf("[%3d/%3d] Estimando coalición: %s\n",
-              i, length(coalitions), key))
-  
-  results_list[[key]] <- estimate_mnl_coalition_apollo(
-    S = S,
-    df = sm,
-    ll_null = ll_null,
-    benchmark_start = benchmark_start
-  )
-}
-
-# -----------------------------
-# 6) Chequeo modelo completo
-# -----------------------------
-full_key <- coalition_key(players)
-full_res <- results_list[[full_key]]
-
-benchmark_probs <- softmax_rows(compute_utilities(sm, benchmark_start))
-benchmark_ll <- loglik_mnl(sm$choice, benchmark_probs)
-benchmark_rho2 <- 1 - benchmark_ll / ll_null
-
-comparison_full <- tibble(
-  parametro = names(benchmark_start),
-  benchmark = as.numeric(benchmark_start),
-  estimate  = as.numeric(full_res$beta[names(benchmark_start)]),
-  diff      = estimate - benchmark
-)
-
-cat("\n=====================================================\n")
-cat("Chequeo de coalición completa\n")
-cat("=====================================================\n")
-cat("LL benchmark validado =", round(benchmark_ll, 3), "\n")
-cat("LL full actual        =", round(full_res$ll_final, 3), "\n")
-cat("rho2 benchmark        =", round(benchmark_rho2, 6), "\n")
-cat("rho2 full actual      =", round(full_res$rho2, 6), "\n\n")
-print(comparison_full)
-
-write_csv(comparison_full, "output/tablas/swissmetro_full_model_vs_benchmark.csv")
-
-# -----------------------------
-# 7) Resumen de coaliciones
-# -----------------------------
-coalition_summary <- bind_rows(lapply(results_list, function(x) {
-  tibble(
-    key = x$key,
-    coalition_size = length(x$coalition),
-    coalition = if (length(x$coalition) == 0) "EMPTY" else paste(x$coalition, collapse = ", "),
-    ll_final = x$ll_final,
-    rho2 = x$rho2,
-    converged = x$converged,
-    method = x$method
-  )
-}))
-
-write_csv(coalition_summary, "output/tablas/swissmetro_coalitions_summary.csv")
-
-# -----------------------------
-# 8) Shapley global exacto
-# -----------------------------
-shapley_global <- setNames(rep(0, P), players)
-
-for (p in players) {
-  absent_sets <- coalitions[!vapply(coalitions, function(S) p %in% S, logical(1))]
-  
-  for (S in absent_sets) {
-    S_plus <- sort(c(S, p))
-    
-    key_S <- coalition_key(S)
-    key_Sp <- coalition_key(S_plus)
-    
-    v_S <- results_list[[key_S]]$rho2
-    v_Sp <- results_list[[key_Sp]]$rho2
-    
-    s <- length(S)
-    weight <- factorial(s) * factorial(P - s - 1) / factorial(P)
-    
-    shapley_global[p] <- shapley_global[p] + weight * (v_Sp - v_S)
-  }
-}
-
-shapley_global_df <- tibble(
-  player = players,
-  shapley_value = as.numeric(shapley_global),
-  share_percent = 100 * shapley_value / sum(shapley_global)
-)
-
-cat("\n=====================================================\n")
-cat("Shapley global exacto\n")
-cat("=====================================================\n")
-print(shapley_global_df)
-cat("\n")
-cat("Suma de Shapley global =", round(sum(shapley_global), 6), "\n")
-cat("rho2 del modelo completo =", round(full_res$rho2, 6), "\n\n")
-
-write_csv(shapley_global_df, "output/tablas/swissmetro_shapley_global_exact.csv")
-
-# -----------------------------
-# 9) SHAP local exacto
-# -----------------------------
-if (CALC_LOCAL) {
-  
-  shapley_local <- array(
-    0,
-    dim = c(N, 3, P),
-    dimnames = list(NULL, c("train", "sm", "car"), players)
-  )
-  
-  for (ip in seq_along(players)) {
-    p <- players[ip]
-    cat("Calculando SHAP local para jugador:", p, "\n")
-    
-    absent_sets <- coalitions[!vapply(coalitions, function(S) p %in% S, logical(1))]
-    
-    for (S in absent_sets) {
-      S_plus <- sort(c(S, p))
-      
-      key_S <- coalition_key(S)
-      key_Sp <- coalition_key(S_plus)
-      
-      probs_S <- results_list[[key_S]]$probs
-      probs_Sp <- results_list[[key_Sp]]$probs
-      
-      s <- length(S)
-      weight <- factorial(s) * factorial(P - s - 1) / factorial(P)
-      
-      shapley_local[, , ip] <- shapley_local[, , ip] + weight * (probs_Sp - probs_S)
-    }
-  }
-  
-  saveRDS(shapley_local, "output/swissmetro_shapley_local_exact.rds")
-  
-  probs_empty <- results_list[["EMPTY"]]$probs
-  probs_full  <- results_list[[full_key]]$probs
-  
-  local_sum   <- apply(shapley_local, c(1, 2), sum)
-  diff_check  <- local_sum - (probs_full - probs_empty)
-  
-  cat("\nMáximo error absoluto en eficiencia local:\n")
-  print(max(abs(diff_check)))
-  cat("\n")
-}
-
-# -----------------------------
-# 10) Datos para gráficos
-# -----------------------------
-make_plot_df <- function(df, shapley_local) {
-  bind_rows(
-    tibble(alternative = "car",   feature = "CAR_CO",    feature_value = df$car_co,   shap = shapley_local[, "car",   "cost"]),
-    tibble(alternative = "car",   feature = "CAR_TT",    feature_value = df$car_tt,   shap = shapley_local[, "car",   "time"]),
-    tibble(alternative = "car",   feature = "LUGGAGE",   feature_value = df$luggage,  shap = shapley_local[, "car",   "luggage"]),
-    
-    tibble(alternative = "train", feature = "GA",        feature_value = df$ga,       shap = shapley_local[, "train", "ga"]),
-    tibble(alternative = "train", feature = "TRAIN_TT",  feature_value = df$train_tt, shap = shapley_local[, "train", "time"]),
-    tibble(alternative = "train", feature = "TRAIN_CO",  feature_value = df$train_co, shap = shapley_local[, "train", "cost"]),
-    tibble(alternative = "train", feature = "AGE",       feature_value = df$age,      shap = shapley_local[, "train", "age"]),
-    
-    tibble(alternative = "sm",    feature = "SM_TT",     feature_value = df$sm_tt,    shap = shapley_local[, "sm",    "time"]),
-    tibble(alternative = "sm",    feature = "GA",        feature_value = df$ga,       shap = shapley_local[, "sm",    "ga"]),
-    tibble(alternative = "sm",    feature = "SM_CO",     feature_value = df$sm_co,    shap = shapley_local[, "sm",    "cost"]),
-    tibble(alternative = "sm",    feature = "SM_SEATS",  feature_value = df$sm_seats, shap = shapley_local[, "sm",    "seats"])
-  ) |>
-    group_by(alternative, feature) |>
-    mutate(mean_abs = mean(abs(shap), na.rm = TRUE)) |>
-    ungroup()
-}
-
-plot_shap_summary_alt <- function(plot_df, alt_name, title_text = NULL) {
-  
-  dat <- plot_df |>
-    filter(alternative == alt_name) |>
-    group_by(feature) |>
-    mutate(ord = mean(abs(shap), na.rm = TRUE)) |>
-    ungroup()
-  
-  rng <- range(dat$feature_value, na.rm = TRUE)
-  if (diff(rng) == 0) {
-    dat <- dat |> mutate(color_value = 0.5)
-  } else {
-    dat <- dat |> mutate(color_value = (feature_value - rng[1]) / diff(rng))
-  }
-  
-  order_levels <- dat |>
-    distinct(feature, ord) |>
-    arrange(ord) |>
-    pull(feature)
-  
-  dat$feature <- factor(dat$feature, levels = order_levels)
-  
-  ggplot(dat, aes(x = shap, y = feature, color = color_value)) +
-    ggbeeswarm::geom_quasirandom(
-      width = 0.28,
-      alpha = 0.75,
-      size = 0.7,
-      groupOnX = FALSE
-    ) +
-    scale_color_gradientn(
-      colours = c("#2b8cbe", "#7bccc4", "#f03b87"),
-      values = c(0, 0.5, 1),
-      limits = c(0, 1),
-      labels = c("Low", "High"),
-      breaks = c(0, 1),
-      name = "Feature value"
-    ) +
-    labs(
-      title = ifelse(is.null(title_text), alt_name, title_text),
-      x = "SHAP value (impact on model output)",
-      y = NULL
-    ) +
-    theme_minimal(base_size = 11) +
-    theme(
-      legend.position = "right",
-      plot.title = element_text(hjust = 0.5, face = "bold"),
-      panel.grid.minor = element_blank()
-    )
-}
-
-make_force_data <- function(row_id, alt_name, df, shapley_local, probs_empty) {
-  
-  if (alt_name == "car") {
-    out <- tibble(
-      feature = c("CAR_CO", "CAR_TT", "LUGGAGE"),
-      value   = c(df$car_co[row_id], df$car_tt[row_id], df$luggage[row_id]),
-      shap    = c(
-        shapley_local[row_id, "car", "cost"],
-        shapley_local[row_id, "car", "time"],
-        shapley_local[row_id, "car", "luggage"]
-      )
-    )
-    base0 <- probs_empty[row_id, "car"]
-  }
-  
-  if (alt_name == "train") {
-    out <- tibble(
-      feature = c("GA", "TRAIN_TT", "TRAIN_CO", "AGE"),
-      value   = c(df$ga[row_id], df$train_tt[row_id], df$train_co[row_id], df$age[row_id]),
-      shap    = c(
-        shapley_local[row_id, "train", "ga"],
-        shapley_local[row_id, "train", "time"],
-        shapley_local[row_id, "train", "cost"],
-        shapley_local[row_id, "train", "age"]
-      )
-    )
-    base0 <- probs_empty[row_id, "train"]
-  }
-  
-  if (alt_name == "sm") {
-    out <- tibble(
-      feature = c("SM_TT", "GA", "SM_CO", "SM_SEATS"),
-      value   = c(df$sm_tt[row_id], df$ga[row_id], df$sm_co[row_id], df$sm_seats[row_id]),
-      shap    = c(
-        shapley_local[row_id, "sm", "time"],
-        shapley_local[row_id, "sm", "ga"],
-        shapley_local[row_id, "sm", "cost"],
-        shapley_local[row_id, "sm", "seats"]
-      )
-    )
-    base0 <- probs_empty[row_id, "sm"]
-  }
-  
-  out <- out |>
-    mutate(
-      abs_shap = abs(shap),
-      sign = ifelse(shap >= 0, "positive", "negative")
-    ) |>
-    arrange(desc(abs_shap))
-  
-  end_vec <- base0 + cumsum(out$shap)
-  start_vec <- c(base0, head(end_vec, -1))
-  
-  out |>
-    mutate(
-      baseline = base0,
-      start = start_vec,
-      end = end_vec,
-      mid = (start + end) / 2
-    )
-}
-
-plot_force_like_alt <- function(row_id, alt_name, df, shapley_local, probs_empty) {
-  
-  dat <- make_force_data(row_id, alt_name, df, shapley_local, probs_empty)
-  baseline <- dat$baseline[1]
-  pred <- baseline + sum(dat$shap)
-  
-  ggplot(dat) +
-    geom_segment(
-      aes(x = start, xend = end, y = feature, yend = feature, color = sign),
-      linewidth = 8,
-      lineend = "butt"
-    ) +
-    geom_vline(xintercept = baseline, linetype = "dashed", color = "grey40") +
-    geom_text(
-      aes(x = mid, y = feature, label = paste0(feature, " = ", round(value, 3))),
-      color = "white",
-      size = 3
-    ) +
-    scale_color_manual(values = c(negative = "#2b8cbe", positive = "#f03b87")) +
-    labs(
-      title = paste0(toupper(alt_name), " | base = ", round(baseline, 3), " | pred = ", round(pred, 3)),
-      x = "Contribución acumulada",
-      y = NULL
-    ) +
-    theme_minimal(base_size = 11) +
-    theme(
-      legend.position = "none",
-      plot.title = element_text(face = "bold")
-    )
-}
-
-# -----------------------------
-# 11) Crear gráficos SHAP
-# -----------------------------
-if (CALC_LOCAL && MAKE_PLOTS) {
-  
-  plot_df <- make_plot_df(sm, shapley_local)
-  
-  p_car <- plot_shap_summary_alt(plot_df, "car",   "Car")
-  p_sm  <- plot_shap_summary_alt(plot_df, "sm",    "Swissmetro")
-  p_tr  <- plot_shap_summary_alt(plot_df, "train", "Train")
-  
-  p_summary_all <- (p_car | p_sm) / p_tr +
-    plot_annotation(title = "SHAP summary plots by alternative")
-  
-  ggsave(
-    filename = "output/figuras/swissmetro_shap_summary_by_alt.png",
-    plot = p_summary_all,
-    width = 12,
-    height = 9,
-    dpi = 300
-  )
-  
-  row_id_force <- 1
-  
-  p_force_car <- plot_force_like_alt(row_id_force, "car", sm, shapley_local, probs_empty)
-  p_force_sm  <- plot_force_like_alt(row_id_force, "sm", sm, shapley_local, probs_empty)
-  p_force_tr  <- plot_force_like_alt(row_id_force, "train", sm, shapley_local, probs_empty)
-  
-  p_force_all <- p_force_car / p_force_sm / p_force_tr +
-    plot_annotation(title = paste0("Local explanation for row ", row_id_force))
-  
-  ggsave(
-    filename = "output/figuras/swissmetro_force_like_row1.png",
-    plot = p_force_all,
-    width = 12,
-    height = 10,
-    dpi = 300
-  )
-}
-
-# -----------------------------
-# 12) Curva de predicción con Apollo
-# -----------------------------
-# Se usa apollo_prediction() y, si su salida no es utilizable
-# en esta sesión, se recurre al cálculo manual con softmax.
-
-database <- sm
-
-apollo_control <- list(
-  modelName       = "Swissmetro_prediction_plot",
-  modelDescr      = "Prediction plot for Swissmetro",
-  indivID         = "id",
-  panelData       = TRUE,
-  outputDirectory = "output/apollo_coalitions"
-)
-
-apollo_beta  <- benchmark_start
-apollo_fixed <- c()
-apollo_inputs <- apollo_validateInputs()
-
-apollo_probabilities <- function(apollo_beta, apollo_inputs, functionality = "estimate") {
-  
-  apollo_attach(apollo_beta, apollo_inputs)
-  on.exit(apollo_detach(apollo_beta, apollo_inputs))
-  
-  V <- list()
-  
-  V[["train"]] <-
-    b_time * train_tt +
-    b_cost * train_co +
-    b_age  * age +
-    b_ga   * ga
-  
-  V[["sm"]] <-
-    asc_sm +
-    b_time  * sm_tt +
-    b_cost  * sm_co +
-    b_ga    * ga +
-    b_seats * sm_seats
-  
-  V[["car"]] <-
-    asc_car +
-    b_time    * car_tt +
-    b_cost    * car_co +
-    b_luggage * luggage
-  
-  P <- list()
-  
-  mnl_settings <- list(
-    alternatives = c(train = 1, sm = 2, car = 3),
-    avail        = list(train = train_av, sm = sm_av, car = car_av),
-    choiceVar    = choice,
-    V            = V
-  )
-  
-  P[["model"]] <- apollo_mnl(mnl_settings, functionality)
-  P <- apollo_panelProd(P, apollo_inputs, functionality)
-  P <- apollo_prepareProb(P, apollo_inputs, functionality)
-  
-  return(P)
-}
-
-extract_prediction_matrix <- function(pred_obj) {
-  
-  if (is.matrix(pred_obj) || is.data.frame(pred_obj)) {
-    pred_df <- as.data.frame(pred_obj)
-    nm <- tolower(names(pred_df))
-    if (all(c("train", "sm", "car") %in% nm)) {
-      names(pred_df) <- nm
-      return(pred_df[, c("train", "sm", "car")])
-    }
-  }
-  
-  if (is.list(pred_obj)) {
-    # caso: lista con componente "model"
-    if ("model" %in% names(pred_obj)) {
-      return(extract_prediction_matrix(pred_obj$model))
-    }
-    
-    # caso: lista nombrada con train/sm/car
-    nm <- tolower(names(pred_obj))
-    if (all(c("train", "sm", "car") %in% nm)) {
-      pred_df <- as.data.frame(pred_obj)
-      names(pred_df) <- nm
-      return(pred_df[, c("train", "sm", "car")])
-    }
-  }
-  
-  NULL
-}
-
-sm_original <- sm
-
-tt_grid <- seq(
-  from = quantile(sm$sm_tt, 0.05, na.rm = TRUE),
-  to   = quantile(sm$sm_tt, 0.95, na.rm = TRUE),
-  length.out = 30
-)
-
-pred_curve <- lapply(tt_grid, function(tt_val) {
-  
-  database <<- sm_original
-  database$sm_tt <- tt_val
-  
-  apollo_inputs_tmp <- apollo_validateInputs()
-  
-  preds_obj <- tryCatch(
-    apollo_prediction(
-      benchmark_start,
+  invisible(capture.output({
+    modelo <- apollo_estimate(
+      apollo_beta,
+      apollo_fixed,
       apollo_probabilities,
-      apollo_inputs_tmp,
-      prediction_settings = list(summary = FALSE)
-    ),
-    error = function(e) NULL
-  )
-  
-  preds_df <- extract_prediction_matrix(preds_obj)
-  
-  # Fallback manual si Apollo no devuelve algo usable
-  if (is.null(preds_df)) {
-    V_tmp <- compute_utilities(database, benchmark_start)
-    preds_df <- as.data.frame(softmax_rows(V_tmp))
-    names(preds_df) <- c("train", "sm", "car")
-  }
-  
-  tibble(
-    sm_tt = tt_val,
-    mean_prob_train = mean(preds_df$train),
-    mean_prob_sm    = mean(preds_df$sm),
-    mean_prob_car   = mean(preds_df$car)
-  )
-}) |>
-  bind_rows()
-
-pred_curve_long <- pred_curve |>
-  pivot_longer(
-    cols = starts_with("mean_prob_"),
-    names_to = "alternative",
-    values_to = "probability"
-  ) |>
-  mutate(
-    alternative = dplyr::recode(
-      alternative,
-      mean_prob_train = "Train",
-      mean_prob_sm    = "Swissmetro",
-      mean_prob_car   = "Car"
+      apollo_inputs
     )
+  }))
+
+  beta <- completar_beta(parametros_activos, modelo$estimate)
+  probabilidades <- calcular_probabilidades(calcular_utilidades(datos, beta))
+  ll_final <- calcular_loglik(datos$choice, probabilidades)
+
+  resultado <- list(
+    coalicion = S,
+    key = key,
+    parametros_activos = parametros_activos,
+    beta = beta,
+    ll_final = ll_final,
+    rho2 = 1 - ll_final / ll_nulo,
+    probabilidades = probabilidades,
+    convergencia = TRUE,
+    metodo = "Apollo_warmstart"
   )
 
-p_pred <- ggplot(pred_curve_long, aes(x = sm_tt, y = probability, color = alternative)) +
-  geom_line(linewidth = 1) +
-  labs(
-    title = "Predicted probabilities as SM_TT varies",
-    x = "Swissmetro travel time",
-    y = "Average predicted probability",
-    color = "Alternative"
-  ) +
-  theme_minimal(base_size = 11)
+  saveRDS(resultado, archivo_cache)
 
-ggsave(
-  filename = "output/figuras/swissmetro_prediction_curve_sm_tt.png",
-  plot = p_pred,
-  width = 9,
-  height = 5,
-  dpi = 300
-)
+  if (limpiar_archivos_apollo) {
+    limpiar_apollo(nombre_modelo)
+  }
 
-database <- sm_original
-
-# -----------------------------
-# 13) Guardar objetos finales
-# -----------------------------
-final_object <- list(
-  players = players,
-  ll_null = ll_null,
-  benchmark_start = benchmark_start,
-  coalition_summary = coalition_summary,
-  full_model = full_res,
-  shapley_global = shapley_global_df,
-  shapley_local = if (CALC_LOCAL) shapley_local else NULL
-)
-
-saveRDS(final_object, "output/swissmetro_shapley_exact_results.rds")
-
-cat("=====================================================\n")
-cat("Proceso terminado\n")
-cat("=====================================================\n")
-cat("Archivos clave:\n")
-cat("- output/tablas/swissmetro_coalitions_summary.csv\n")
-cat("- output/tablas/swissmetro_full_model_vs_benchmark.csv\n")
-cat("- output/tablas/swissmetro_shapley_global_exact.csv\n")
-if (CALC_LOCAL) {
-  cat("- output/swissmetro_shapley_local_exact.rds\n")
-  cat("- output/figuras/swissmetro_shap_summary_by_alt.png\n")
-  cat("- output/figuras/swissmetro_force_like_row1.png\n")
+  return(resultado)
 }
-cat("- output/figuras/swissmetro_prediction_curve_sm_tt.png\n")
-cat("- output/swissmetro_shapley_exact_results.rds\n")
+
+# 7. Calcular Shapley exacto
+peso_shapley <- function(s, p) {
+  return(factorial(s) * factorial(p - s - 1) / factorial(p))
+}
+
+calcular_shapley_global <- function(resultados, coaliciones, jugadores) {
+  p <- length(jugadores)
+  phi <- setNames(rep(0, p), jugadores)
+
+  for (jugador in jugadores) {
+    coaliciones_sin_jugador <- coaliciones[
+      !sapply(coaliciones, function(S) jugador %in% S)
+    ]
+
+    for (S in coaliciones_sin_jugador) {
+      key_S <- clave_coalicion(S)
+      key_S_mas_jugador <- clave_coalicion(c(S, jugador))
+      w <- peso_shapley(length(S), p)
+
+      phi[jugador] <- phi[jugador] +
+        w * (resultados[[key_S_mas_jugador]]$rho2 - resultados[[key_S]]$rho2)
+    }
+  }
+
+  tabla <- data.frame(
+    player = names(phi),
+    shapley_value = as.numeric(phi),
+    share_percent = 100 * as.numeric(phi) / sum(phi),
+    row.names = NULL
+  )
+
+  tabla <- tabla[order(-tabla$shapley_value), ]
+  return(tabla)
+}
+
+calcular_shapley_local <- function(resultados, coaliciones, jugadores, n_obs) {
+  p <- length(jugadores)
+  phi <- array(
+    0,
+    dim = c(n_obs, 3, p),
+    dimnames = list(NULL, c("train", "sm", "car"), jugadores)
+  )
+
+  for (i in seq_along(jugadores)) {
+    jugador <- jugadores[i]
+    cat("Calculando SHAP local para:", jugador, "\n")
+
+    coaliciones_sin_jugador <- coaliciones[
+      !sapply(coaliciones, function(S) jugador %in% S)
+    ]
+
+    for (S in coaliciones_sin_jugador) {
+      key_S <- clave_coalicion(S)
+      key_S_mas_jugador <- clave_coalicion(c(S, jugador))
+      w <- peso_shapley(length(S), p)
+
+      phi[, , i] <- phi[, , i] +
+        w * (
+          resultados[[key_S_mas_jugador]]$probabilidades -
+            resultados[[key_S]]$probabilidades
+        )
+    }
+  }
+
+  return(phi)
+}
+
+# 8. Preparar tablas, chequeos y graficos
+resumir_coaliciones <- function(resultados) {
+  tabla <- do.call(
+    rbind,
+    lapply(resultados, function(x) {
+      data.frame(
+        key = x$key,
+        coalition_size = length(x$coalicion),
+        coalition = if (length(x$coalicion) == 0) "EMPTY" else paste(x$coalicion, collapse = ", "),
+        ll_final = x$ll_final,
+        rho2 = x$rho2,
+        converged = x$convergencia,
+        method = x$metodo,
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+
+  tabla <- tabla[order(tabla$coalition_size, tabla$key), ]
+  row.names(tabla) <- NULL
+  return(tabla)
+}
+
+comparar_modelo_completo <- function(resultados, datos) {
+  key_completo <- clave_coalicion(jugadores)
+  modelo_completo <- resultados[[key_completo]]
+
+  probabilidades_benchmark <- calcular_probabilidades(
+    calcular_utilidades(datos, coeficientes_iniciales)
+  )
+  ll_benchmark <- calcular_loglik(datos$choice, probabilidades_benchmark)
+  rho2_benchmark <- 1 - ll_benchmark / ll_nulo
+
+  parametros <- data.frame(
+    parametro = names(coeficientes_iniciales),
+    benchmark = as.numeric(coeficientes_iniciales),
+    estimate = as.numeric(modelo_completo$beta[names(coeficientes_iniciales)]),
+    stringsAsFactors = FALSE
+  )
+  parametros$diff <- parametros$estimate - parametros$benchmark
+
+  metricas <- data.frame(
+    metric = c("ll_benchmark", "ll_full", "rho2_benchmark", "rho2_full"),
+    value = c(ll_benchmark, modelo_completo$ll_final, rho2_benchmark, modelo_completo$rho2),
+    stringsAsFactors = FALSE
+  )
+
+  return(list(parametros = parametros, metricas = metricas, modelo = modelo_completo))
+}
+
+chequear_eficiencia <- function(resultados, shapley_global, shapley_local) {
+  key_completo <- clave_coalicion(jugadores)
+
+  error_global <- sum(shapley_global$shapley_value) -
+    (resultados[[key_completo]]$rho2 - resultados[["EMPTY"]]$rho2)
+
+  chequeos <- data.frame(
+    check = "global_efficiency_error",
+    value = error_global,
+    stringsAsFactors = FALSE
+  )
+
+  if (!is.null(shapley_local)) {
+    suma_local <- apply(shapley_local, c(1, 2), sum)
+    objetivo_local <- resultados[[key_completo]]$probabilidades -
+      resultados[["EMPTY"]]$probabilidades
+
+    chequeos <- rbind(
+      chequeos,
+      data.frame(
+        check = "max_local_efficiency_error",
+        value = max(abs(suma_local - objetivo_local)),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  return(chequeos)
+}
+
+preparar_datos_locales <- function(datos, shapley_local) {
+  tabla <- rbind(
+    data.frame(alternative = "car", feature = "CAR_CO", value = datos$car_co, shap = shapley_local[, "car", "cost"]),
+    data.frame(alternative = "car", feature = "CAR_TT", value = datos$car_tt, shap = shapley_local[, "car", "time"]),
+    data.frame(alternative = "car", feature = "LUGGAGE", value = datos$luggage, shap = shapley_local[, "car", "luggage"]),
+    data.frame(alternative = "train", feature = "GA", value = datos$ga, shap = shapley_local[, "train", "ga"]),
+    data.frame(alternative = "train", feature = "TRAIN_TT", value = datos$train_tt, shap = shapley_local[, "train", "time"]),
+    data.frame(alternative = "train", feature = "TRAIN_CO", value = datos$train_co, shap = shapley_local[, "train", "cost"]),
+    data.frame(alternative = "train", feature = "AGE", value = datos$age, shap = shapley_local[, "train", "age"]),
+    data.frame(alternative = "sm", feature = "SM_TT", value = datos$sm_tt, shap = shapley_local[, "sm", "time"]),
+    data.frame(alternative = "sm", feature = "GA", value = datos$ga, shap = shapley_local[, "sm", "ga"]),
+    data.frame(alternative = "sm", feature = "SM_CO", value = datos$sm_co, shap = shapley_local[, "sm", "cost"]),
+    data.frame(alternative = "sm", feature = "SM_SEATS", value = datos$sm_seats, shap = shapley_local[, "sm", "seats"])
+  )
+
+  tabla$mean_abs_shap <- ave(abs(tabla$shap), tabla$alternative, tabla$feature, FUN = mean)
+  return(tabla)
+}
+
+guardar_graficos <- function(shapley_global, datos_locales) {
+  grafico_global <- ggplot(
+    shapley_global,
+    aes(x = reorder(player, shapley_value), y = share_percent)
+  ) +
+    geom_col(fill = "#3366A8", width = 0.7) +
+    coord_flip() +
+    labs(
+      title = "Shapley global exacto",
+      x = NULL,
+      y = "Participacion (%)"
+    ) +
+    theme_minimal()
+
+  ggsave(
+    file.path(directorio_figuras, "swissmetro_shapley_global_exact.png"),
+    grafico_global,
+    width = 7,
+    height = 4.5,
+    dpi = 300
+  )
+
+  if (!is.null(datos_locales)) {
+    datos_locales$feature <- reorder(datos_locales$feature, datos_locales$mean_abs_shap)
+
+    grafico_local <- ggplot(
+      datos_locales,
+      aes(x = shap, y = feature, color = value)
+    ) +
+      geom_point(
+        alpha = 0.45,
+        size = 0.6,
+        position = position_jitter(height = 0.18, width = 0)
+      ) +
+      facet_wrap(~alternative, scales = "free_y") +
+      scale_color_gradient(low = "#3366A8", high = "#B33A3A") +
+      labs(
+        title = "SHAP local exacto por alternativa",
+        x = "Contribucion a la probabilidad predicha",
+        y = NULL,
+        color = "Valor"
+      ) +
+      theme_minimal()
+
+    ggsave(
+      file.path(directorio_figuras, "swissmetro_shapley_local_summary.png"),
+      grafico_local,
+      width = 10,
+      height = 6,
+      dpi = 300
+    )
+  }
+}
+
+# 9. Estimar todas las coaliciones
+apollo_initialise()
+
+coaliciones <- generar_coaliciones(jugadores)
+resultados <- vector("list", length(coaliciones))
+names(resultados) <- sapply(coaliciones, clave_coalicion)
+
+cat("=====================================================\n")
+cat("Swissmetro: Shapley exacto global y local\n")
+cat("=====================================================\n")
+cat("Observaciones:", n_obs, "\n")
+cat("IDs unicos:", length(unique(df$id)), "\n")
+cat("Jugadores:", paste(jugadores, collapse = ", "), "\n")
+cat("Coaliciones:", length(coaliciones), "de", 2^length(jugadores), "\n\n")
+
+for (i in seq_along(coaliciones)) {
+  key <- names(resultados)[i]
+  cat(sprintf("[%3d/%3d] Coalicion: %s\n", i, length(coaliciones), key))
+  resultados[[key]] <- estimar_coalicion(coaliciones[[i]], df)
+}
+
+# 10. Calcular resultados exactos
+resumen_coaliciones <- resumir_coaliciones(resultados)
+comparacion_completa <- comparar_modelo_completo(resultados, df)
+shapley_global <- calcular_shapley_global(resultados, coaliciones, jugadores)
+
+shapley_local <- NULL
+datos_locales <- NULL
+
+if (calcular_local) {
+  shapley_local <- calcular_shapley_local(resultados, coaliciones, jugadores, n_obs)
+  datos_locales <- preparar_datos_locales(df, shapley_local)
+}
+
+chequeos <- chequear_eficiencia(resultados, shapley_global, shapley_local)
+
+# La eficiencia es la propiedad central del calculo exacto.
+if (max(abs(chequeos$value)) > 1e-8) {
+  stop("Fallo el chequeo de eficiencia Shapley.", call. = FALSE)
+}
+
+# 11. Guardar tablas y objetos
+write.csv(
+  resumen_coaliciones,
+  file.path(directorio_tablas, "swissmetro_coalitions_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  comparacion_completa$parametros,
+  file.path(directorio_tablas, "swissmetro_full_model_vs_benchmark.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  comparacion_completa$metricas,
+  file.path(directorio_tablas, "swissmetro_full_model_metrics.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  shapley_global,
+  file.path(directorio_tablas, "swissmetro_shapley_global_exact.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  chequeos,
+  file.path(directorio_tablas, "swissmetro_shapley_exact_checks.csv"),
+  row.names = FALSE
+)
+
+if (!is.null(datos_locales)) {
+  write.csv(
+    datos_locales,
+    file.path(directorio_tablas, "swissmetro_shapley_local_plot_data.csv"),
+    row.names = FALSE
+  )
+
+  saveRDS(
+    shapley_local,
+    file.path(directorio_salida, "swissmetro_shapley_local_exact.rds")
+  )
+}
+
+objeto_final <- list(
+  players = jugadores,
+  param_map = mapa_parametros,
+  benchmark_start = coeficientes_iniciales,
+  ll_null = ll_nulo,
+  coalition_summary = resumen_coaliciones,
+  full_model = comparacion_completa$modelo,
+  full_model_comparison = comparacion_completa$parametros,
+  full_model_metrics = comparacion_completa$metricas,
+  shapley_global = shapley_global,
+  shapley_local = shapley_local,
+  checks = chequeos
+)
+
+saveRDS(
+  objeto_final,
+  file.path(directorio_salida, "swissmetro_shapley_exact_results.rds")
+)
+
+# 12. Guardar graficos
+if (hacer_graficos) {
+  guardar_graficos(shapley_global, datos_locales)
+}
+
+# 13. Imprimir resultados principales
+cat("\n=====================================================\n")
+cat("Shapley exacto terminado\n")
+cat("=====================================================\n")
+cat("Observaciones usadas:", n_obs, "\n")
+cat("Error eficiencia global:", chequeos$value[chequeos$check == "global_efficiency_error"], "\n")
+
+if ("max_local_efficiency_error" %in% chequeos$check) {
+  cat("Error maximo eficiencia local:", chequeos$value[chequeos$check == "max_local_efficiency_error"], "\n")
+}
+
+cat("\nComparacion modelo completo con Salas et al. (2025):\n")
+print(comparacion_completa$parametros)
+cat("\n")
+
+cat("Shapley global exacto:\n")
+print(shapley_global)
+cat("\n")
+
+cat("Tablas guardadas en:", directorio_tablas, "\n")
+cat("Graficos guardados en:", directorio_figuras, "\n")
