@@ -3,124 +3,120 @@
 # Relevancia preliminar de atributos con Boruta en Swissmetro
 # =========================================================
 
-# -----------------------------
-# 0) Paquetes
-# -----------------------------
+# 1. Cargar paquete
 library(Boruta)
 
 set.seed(2026)
 
-# -----------------------------
-# 1) Rutas
-# -----------------------------
-DATA_FILE <- "data/processed/swissmetro_clean.csv"
-OUTPUT_DIR <- "output"
-TABLE_DIR <- file.path(OUTPUT_DIR, "tablas")
-FIGURE_DIR <- file.path(OUTPUT_DIR, "figuras")
+# 2. Definir rutas
+archivo_entrada <- "swissmetro_limpio.csv"
+directorio_salida <- "output"
+directorio_tablas <- file.path(directorio_salida, "tablas")
+directorio_figuras <- file.path(directorio_salida, "figuras")
 
-dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
-dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(directorio_tablas, recursive = TRUE, showWarnings = FALSE)
+dir.create(directorio_figuras, recursive = TRUE, showWarnings = FALSE)
 
-# -----------------------------
-# 2) Cargar y preparar datos
-# -----------------------------
-sm <- read.csv(DATA_FILE)
+# 3. Cargar datos resultantes de 02_depurar.R
+if (!file.exists(archivo_entrada)) {
+  source("02_depurar.R")
+}
 
-sm$choice <- factor(
-  sm$choice,
+df <- read.csv(archivo_entrada, stringsAsFactors = FALSE)
+
+# 4. Preparar variables para Boruta
+df$CHOICE <- factor(
+  df$CHOICE,
   levels = c(1, 2, 3),
   labels = c("train", "swissmetro", "car")
 )
 
-factor_vars <- c(
-  "age", "ga", "luggage", "male", "income",
-  "purpose", "first", "group", "sm_seats"
-)
-sm[factor_vars] <- lapply(sm[factor_vars], factor)
+variables_factor <- c("AGE", "GA", "SM_SEATS", "LUGGAGE")
+df[variables_factor] <- lapply(df[variables_factor], factor)
 
-boruta_vars <- c(
-  "choice",
-  "train_tt", "train_co", "train_he",
-  "sm_tt", "sm_co", "sm_he", "sm_seats",
-  "car_tt", "car_co",
-  "age", "ga", "luggage",
-  "male", "income", "purpose", "first", "group"
+variables_boruta <- c(
+  "CHOICE",
+  "CAR_TT", "TRAIN_TT", "SM_TT",
+  "CAR_CO", "TRAIN_CO", "SM_CO",
+  "AGE", "GA", "SM_SEATS", "LUGGAGE"
 )
 
-boruta_data <- na.omit(sm[boruta_vars])
+datos_boruta <- na.omit(df[variables_boruta])
 
-# -----------------------------
-# 3) Ejecutar Boruta
-# -----------------------------
-boruta_fit <- Boruta(
-  choice ~ .,
-  data = boruta_data,
+# 5. Ejecutar Boruta
+ajuste_boruta <- Boruta(
+  CHOICE ~ .,
+  data = datos_boruta,
   maxRuns = 200,
   doTrace = 1
 )
 
-boruta_final <- TentativeRoughFix(boruta_fit)
+ajuste_boruta_final <- TentativeRoughFix(ajuste_boruta)
 
-# -----------------------------
-# 4) Guardar tabla de importancia
-# -----------------------------
+# 6. Guardar tabla de importancia
 grupo_mnl <- c(
-  train_tt = "time", sm_tt = "time", car_tt = "time",
-  train_co = "cost", sm_co = "cost", car_co = "cost",
-  train_he = "headway", sm_he = "headway",
-  sm_seats = "seats",
-  age = "age", ga = "ga", luggage = "luggage",
-  male = "socioeconomic", income = "socioeconomic",
-  purpose = "trip_context", first = "trip_context", group = "trip_context"
+  CAR_TT = "TT",
+  TRAIN_TT = "TT",
+  SM_TT = "TT",
+  CAR_CO = "COST",
+  TRAIN_CO = "COST",
+  SM_CO = "COST",
+  AGE = "AGE",
+  GA = "GA",
+  SM_SEATS = "SEATS",
+  LUGGAGE = "LUGGAGE"
 )
 
-boruta_importance <- attStats(boruta_final)
-boruta_importance <- data.frame(
-  variable = rownames(boruta_importance),
-  boruta_importance,
+importancia_boruta <- attStats(ajuste_boruta_final)
+importancia_boruta <- data.frame(
+  variable = rownames(importancia_boruta),
+  importancia_boruta,
   row.names = NULL
 )
-boruta_importance$grupo_mnl <- unname(grupo_mnl[boruta_importance$variable])
-boruta_importance$grupo_mnl[is.na(boruta_importance$grupo_mnl)] <- "other"
+
+importancia_boruta$grupo_mnl <- unname(grupo_mnl[importancia_boruta$variable])
+importancia_boruta$grupo_mnl[is.na(importancia_boruta$grupo_mnl)] <- "other"
 
 orden <- order(
-  boruta_importance$decision != "Confirmed",
-  -boruta_importance$medianImp
+  importancia_boruta$decision != "Confirmed",
+  -importancia_boruta$medianImp
 )
-boruta_importance <- boruta_importance[orden, ]
+
+importancia_boruta <- importancia_boruta[orden, ]
 
 write.csv(
-  boruta_importance,
-  file.path(TABLE_DIR, "boruta_importancia_swissmetro.csv"),
+  importancia_boruta,
+  file.path(directorio_tablas, "boruta_importancia_swissmetro.csv"),
   row.names = FALSE
 )
 
-# -----------------------------
-# 5) Guardar grafico
-# -----------------------------
+# 7. Guardar grafico
 png(
-  filename = file.path(FIGURE_DIR, "boruta_importancia_swissmetro.png"),
+  filename = file.path(directorio_figuras, "boruta_importancia_swissmetro.png"),
   width = 1300,
   height = 800,
   res = 120
 )
+
 plot(
-  boruta_final,
+  ajuste_boruta_final,
   sort = TRUE,
   las = 2,
   cex.axis = 0.75,
   main = "Boruta: importancia preliminar de atributos"
 )
+
 dev.off()
 
+# 8. Imprimir resultados principales
 cat("=====================================================\n")
 cat("Boruta terminado\n")
 cat("=====================================================\n")
-cat("Observaciones usadas:", nrow(boruta_data), "\n\n")
+cat("Observaciones usadas:", nrow(datos_boruta), "\n\n")
 
 cat("Variables confirmadas:\n")
-print(boruta_importance[boruta_importance$decision == "Confirmed", ])
+print(importancia_boruta[importancia_boruta$decision == "Confirmed", ])
 cat("\n")
 
-cat("Tabla guardada en:", file.path(TABLE_DIR, "boruta_importancia_swissmetro.csv"), "\n")
-cat("Grafico guardado en:", file.path(FIGURE_DIR, "boruta_importancia_swissmetro.png"), "\n")
+cat("Tabla guardada en:", file.path(directorio_tablas, "boruta_importancia_swissmetro.csv"), "\n")
+cat("Grafico guardado en:", file.path(directorio_figuras, "boruta_importancia_swissmetro.png"), "\n")
